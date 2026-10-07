@@ -18,7 +18,8 @@ function fixture(poll: Value = {}, issues: Value[] = [], catalog: Value = {}) {
   let domQueries = 0;
   const catalogNotifications: Value[] = [];
   let catalogImports = 0;
-  const document = { get readyState() { return catalog.loading ? "loading" : "complete"; }, addEventListener(name: string, listener: Function) { documentListeners.set(name, listener); }, removeEventListener(name: string) { documentListeners.delete(name); }, querySelectorAll(selector: string) { domQueries++; return selector.startsWith("link") && !catalog.missing ? [{ href: "https://codex.test/assets/app-initial-test.js" }] : []; } };
+  const importedModules: string[] = [];
+  const document = { get readyState() { return catalog.loading ? "loading" : "complete"; }, addEventListener(name: string, listener: Function) { documentListeners.set(name, listener); }, removeEventListener(name: string) { documentListeners.delete(name); }, querySelectorAll(selector: string) { domQueries++; return selector.startsWith("link") && !catalog.missing ? (catalog.modules || ["app-initial-test.js"]).map((name: string) => ({ href: "https://codex.test/assets/" + name })) : []; } };
   const window: Value = {
     addEventListener(name: string, listener: Function) { listeners.set(name, listener); },
     removeEventListener(name: string) { listeners.delete(name); },
@@ -40,11 +41,11 @@ function fixture(poll: Value = {}, issues: Value[] = [], catalog: Value = {}) {
       },
     },
   };
-  const context: Value = { window, document, crypto: { randomUUID }, location: { origin: "codex://desktop", pathname: "/" }, console: { info() {} }, URL, Date: FixtureDate, catalogModule: async () => { catalogImports++; return { services: { localThreadCatalog: { async notifyThread(value: Value, action: string) { if(catalog.failure) throw new Error(catalog.failure); catalogNotifications.push({ ...value, action }); } } } }; }, setTimeout, clearTimeout, setInterval: () => 1, clearInterval() {}, Promise, MessageEvent: class {} };
-  runInNewContext(desktopBridgeBundle.replace("await import(entry.href)", "await catalogModule()"), context);
+  const context: Value = { window, document, crypto: { randomUUID }, location: { origin: "codex://desktop", pathname: "/" }, console: { info() {} }, URL, Date: FixtureDate, catalogModule: async (href: string) => { catalogImports++; importedModules.push(href); if (catalog.serviceMissing || (catalog.serviceModule && !href.endsWith("/" + catalog.serviceModule))) return { unrelated: {}, incomplete: { localThreadCatalog: {} } }; return { services: { localThreadCatalog: { async notifyThread(value: Value, action: string) { if(catalog.failure) throw new Error(catalog.failure); catalogNotifications.push({ ...value, action }); } } } }; }, setTimeout, clearTimeout, setInterval: () => 1, clearInterval() {}, Promise, MessageEvent: class {} };
+  runInNewContext(desktopBridgeBundle.replace("await import(entry.href)", "await catalogModule(entry.href)"), context);
   const config = { version: "test-version", bundleChecksum: "test-checksum", profile: "test-profile", bridgeToken: "test-token", baseUrl: "http://127.0.0.1:1234", selectors: { threadRow: "[data-thread]" }, attributes: { threadId: "data-thread" }, navigation: { messageType: "navigate-to-route", threadRoutePrefix: "/local/" } };
   const result = context.BetterCodexDesktopBridge.install(config);
-  return { window, config, context, result, requests, appRequests, navigations, documentListeners, clock, catalog, catalogNotifications, catalogImports: () => catalogImports, domQueries: () => domQueries };
+  return { window, config, context, result, requests, appRequests, navigations, documentListeners, clock, catalog, catalogNotifications, importedModules, catalogImports: () => catalogImports, domQueries: () => domQueries };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
@@ -101,6 +102,59 @@ test("missing desktop catalog cannot establish readiness", async () => {
   await flush();
   assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.ready(), false);
   assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.bootstrapError(), "desktop_catalog_module_unavailable");
+  fixtureValue.window.__betterCodexDesktopBridge__.destroy();
+});
+
+for (const modules of [
+  ["app-initial-test.js", "app-shared-test.js"],
+  ["app-shared-test.js", "app-initial-test.js"],
+  ["app-shared-test.js"],
+]) {
+  test(`shared desktop catalog establishes readiness and synchronizes actions with ${modules.join(", ")}`, async () => {
+    const poll = { catalog_actions: [{ thread_id: threadId, event_id: "event-test", action: "archive" }] };
+    const fixtureValue = fixture(poll, [], { modules: ["unrelated-test.js", ...modules], serviceModule: "app-shared-test.js" });
+    await flush();
+    assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.ready(), true);
+    assert.deepEqual(fixtureValue.catalogNotifications, [{ hostId: "local", threadId, action: "remove" }]);
+    const ack = fixtureValue.requests.find(value => value.path === "/api/session-relay/catalog-ack");
+    assert.equal(JSON.parse(ack?.body).error, "");
+    assert.deepEqual(fixtureValue.importedModules, modules.slice(0, modules.indexOf("app-shared-test.js") + 1).map(name => "https://codex.test/assets/" + name));
+    const imports = fixtureValue.catalogImports();
+    poll.catalog_actions[0].action = "unarchive";
+    fixtureValue.window.__betterCodexDesktopBridge__.pulse();
+    await flush();
+    assert.equal(fixtureValue.catalogNotifications.at(-1)?.action, "upsert");
+    assert.equal(fixtureValue.catalogImports(), imports);
+    fixtureValue.window.__betterCodexDesktopBridge__.destroy();
+  });
+}
+
+test("desktop modules without catalog capability remain failed and retry discovery", async () => {
+  const fixtureValue = fixture({}, [], { modules: ["app-initial-test.js", "app-shared-test.js"], serviceMissing: true, serviceModule: "app-shared-test.js" });
+  await flush();
+  assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.ready(), false);
+  assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.bootstrapError(), "desktop_catalog_service_unavailable");
+  assert.equal(JSON.parse(fixtureValue.requests[0].body).capability, "failed");
+  fixtureValue.catalog.serviceMissing = false;
+  fixtureValue.clock.now += 10001;
+  fixtureValue.window.__betterCodexDesktopBridge__.pulse();
+  await flush();
+  assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.ready(), true);
+  fixtureValue.window.__betterCodexDesktopBridge__.destroy();
+});
+
+test("shared catalog capability loading remains retryable", async () => {
+  const fixtureValue = fixture({}, [], { modules: ["app-shared-test.js"], serviceMissing: true, loading: true });
+  await flush();
+  assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.ready(), false);
+  assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.bootstrapError(), "desktop_catalog_loading");
+  assert.equal(JSON.parse(fixtureValue.requests[0].body).capability, "unknown");
+  fixtureValue.catalog.serviceMissing = false;
+  fixtureValue.catalog.loading = false;
+  fixtureValue.clock.now += 1000;
+  fixtureValue.window.__betterCodexDesktopBridge__.pulse();
+  await flush();
+  assert.equal(fixtureValue.window.__betterCodexDesktopBridge__.ready(), true);
   fixtureValue.window.__betterCodexDesktopBridge__.destroy();
 });
 

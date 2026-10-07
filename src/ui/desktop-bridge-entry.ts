@@ -554,12 +554,14 @@ async function reconcileRelayTurns(values) {
 
 async function resolveDesktopCatalogServices() {
       if (desktopCatalogServices) return desktopCatalogServices;
-      const entry = Array.from(document.querySelectorAll('link[rel="modulepreload"][href]')).find(link => /\/app-initial-[^/]+\.js$/.test(new URL(link.href).pathname));
-      if (!entry) throw new Error(document.readyState === "loading" ? "desktop_catalog_loading" : "desktop_catalog_module_unavailable");
-      const exports = await import(entry.href);
-      desktopCatalogServices = Object.values(exports).find(value => value && typeof value === "object" && typeof value.localThreadCatalog?.notifyThread === "function");
-      if (!desktopCatalogServices) throw new Error(document.readyState === "loading" ? "desktop_catalog_loading" : "desktop_catalog_service_unavailable");
-      return desktopCatalogServices;
+      const entries = Array.from(document.querySelectorAll('link[rel="modulepreload"][href]')).filter(link => /\/app-(?:initial|shared)-[^/]+\.js$/.test(new URL(link.href).pathname));
+      if (!entries.length) throw new Error(document.readyState === "loading" ? "desktop_catalog_loading" : "desktop_catalog_module_unavailable");
+      for (const entry of entries) {
+        const exports = await import(entry.href);
+        desktopCatalogServices = Object.values(exports).find(value => value && typeof value === "object" && typeof value.localThreadCatalog?.notifyThread === "function");
+        if (desktopCatalogServices) return desktopCatalogServices;
+      }
+      throw new Error(document.readyState === "loading" ? "desktop_catalog_loading" : "desktop_catalog_service_unavailable");
     }
 
 async function syncThreadCatalogAction(action) {
